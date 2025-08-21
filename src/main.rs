@@ -7,19 +7,32 @@ use std::time::Instant;
 
 /// 4 direcciones fijas para loops tiny y branch-predictable
 #[derive(Clone, Copy)]
-enum Dir { North = 0, South = 1, East = 2, West = 3 }
+#[repr(u8)]
+enum Dir {
+    North = 0,
+    South = 1,
+    East = 2,
+    West = 3,
+}
+
 impl Dir {
+    #[inline(always)]
     fn from_str(s: &str) -> Option<Dir> {
-        match s {
-            "north" => Some(Dir::North),
-            "south" => Some(Dir::South),
-            "east"  => Some(Dir::East),
-            "west"  => Some(Dir::West),
+        match s.as_bytes() {
+            b"north" => Some(Dir::North),
+            b"south" => Some(Dir::South),
+            b"east" => Some(Dir::East),
+            b"west" => Some(Dir::West),
             _ => None,
         }
     }
+    
     const ALL: [Dir; 4] = [Dir::North, Dir::South, Dir::East, Dir::West];
-    #[inline] fn idx(self) -> usize { self as usize }
+    
+    #[inline(always)]
+    fn idx(self) -> usize {
+        self as usize
+    }
 }
 
 /// Sentinel para "sin túnel"
@@ -27,14 +40,21 @@ const INVALID: u32 = u32::MAX;
 
 /// Nodo del grafo (compacto y cache-friendly)
 #[derive(Clone, Debug)]
+#[repr(C)]
 struct Node {
-    name_idx: u32,       // índice en names
-    neigh: [u32; 4],     // vecinos por dirección; INVALID si no hay
-    alive: bool,         // colonia viva
+    name_idx: u32,   // índice en names
+    neigh: [u32; 4], // vecinos por dirección; INVALID si no hay
+    alive: bool,     // colonia viva
 }
+
 impl Node {
+    #[inline]
     fn new(name_idx: u32) -> Self {
-        Self { name_idx, neigh: [INVALID; 4], alive: true }
+        Self {
+            name_idx,
+            neigh: [INVALID; 4],
+            alive: true,
+        }
     }
 }
 
@@ -45,14 +65,47 @@ struct World {
     nodes: Vec<Node>,
 }
 
-/// Estado de hormiga
+/// Estado de hormiga - reorganizado para mejor alineación de memoria
 #[derive(Clone, Debug)]
+#[repr(C)]
 struct Ant {
-    id: u32,
     pos: u32,
+    id: u32,
     moves: u32,
-    alive: bool,
-    trapped: bool,
+    state: u8, // Combina alive y trapped en un solo byte
+}
+
+impl Ant {
+    const ALIVE_BIT: u8 = 0b01;
+    const TRAPPED_BIT: u8 = 0b10;
+    
+    #[inline(always)]
+    fn is_alive(&self) -> bool {
+        self.state & Self::ALIVE_BIT != 0
+    }
+    
+    #[inline(always)]
+    fn is_trapped(&self) -> bool {
+        self.state & Self::TRAPPED_BIT != 0
+    }
+    
+    #[inline(always)]
+    fn set_alive(&mut self, alive: bool) {
+        if alive {
+            self.state |= Self::ALIVE_BIT;
+        } else {
+            self.state &= !Self::ALIVE_BIT;
+        }
+    }
+    
+    #[inline(always)]
+    fn set_trapped(&mut self, trapped: bool) {
+        if trapped {
+            self.state |= Self::TRAPPED_BIT;
+        } else {
+            self.state &= !Self::TRAPPED_BIT;
+        }
+    }
 }
 
 /// CLI
@@ -80,19 +133,21 @@ struct Args {
     suppress_events: bool,
 }
 
-/// Parseo en dos fases; el hashmap existe solo durante el parse y se descarta
+/// Parseo optimizado con preallocación
 fn parse_world(path: &str) -> World {
     let file = File::open(path).expect("cannot open map file");
-    let reader = BufReader::new(file);
+    let reader = BufReader::with_capacity(65536, file); // Buffer más grande
 
-    let mut names: Vec<String> = Vec::new();
-    let mut name_to_id: HashMap<String, u32> = HashMap::new();
-    let mut edges: Vec<(u32, Dir, String)> = Vec::new();
+    let mut names: Vec<String> = Vec::with_capacity(1024);
+    let mut name_to_id: HashMap<String, u32> = HashMap::with_capacity(1024);
+    let mut edges: Vec<(u32, Dir, String)> = Vec::with_capacity(4096);
 
     for line in reader.lines() {
         let line = line.expect("failed to read line");
         let line = line.trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
 
         let mut parts = line.split_whitespace();
         let colony = parts.next().expect("invalid line: missing colony name");
@@ -104,238 +159,324 @@ fn parse_world(path: &str) -> World {
         });
 
         for kv in parts {
-            let mut it = kv.split('=');
-            let dir_s = it.next().unwrap_or_default();
-            let dst_s = it.next().unwrap_or_default();
-            let dir = Dir::from_str(dir_s).expect("invalid direction");
-            edges.push((src_id, dir, dst_s.to_string()));
+            if let Some(eq_pos) = kv.find('=') {
+                let dir_s = &kv[..eq_pos];
+                let dst_s = &kv[eq_pos + 1..];
+                if let Some(dir) = Dir::from_str(dir_s) {
+                    edges.push((src_id, dir, dst_s.to_string()));
+                }
+            }
         }
     }
 
     // Asegurar ids para destinos no vistos como origen
     for (_, _, dst) in &edges {
-        if !name_to_id.contains_key(dst) {
+        name_to_id.entry(dst.clone()).or_insert_with(|| {
             let id = names.len() as u32;
-            name_to_id.insert(dst.clone(), id);
             names.push(dst.clone());
-        }
+            id
+        });
     }
 
-    let mut nodes: Vec<Node> = (0..names.len())
-        .map(|i| Node::new(i as u32))
-        .collect();
+    let mut nodes: Vec<Node> = Vec::with_capacity(names.len());
+    for i in 0..names.len() {
+        nodes.push(Node::new(i as u32));
+    }
 
-    for (src, dir, dst_name) in edges {
-        let dst = *name_to_id.get(&dst_name).unwrap();
-        nodes[src as usize].neigh[dir.idx()] = dst;
+    // Usar referencias para evitar copias innecesarias
+    for (src, dir, dst_name) in &edges {
+        if let Some(&dst) = name_to_id.get(dst_name) {
+            nodes[*src as usize].neigh[dir.idx()] = dst;
+        }
     }
 
     World { names, nodes }
 }
 
-/// Coloca N hormigas en nodos vivos al azar
+/// Coloca N hormigas en nodos vivos al azar - optimizada
 fn create_ants(world: &World, n: usize, rng: &mut fastrand::Rng) -> Vec<Ant> {
-    let alive_nodes: Vec<u32> = world.nodes.iter()
+    let alive_nodes: Vec<u32> = world
+        .nodes
+        .iter()
         .enumerate()
-        .filter(|(_, nd)| nd.alive)
-        .map(|(i, _)| i as u32)
+        .filter_map(|(i, nd)| {
+            if nd.alive {
+                Some(i as u32)
+            } else {
+                None
+            }
+        })
         .collect();
 
     let mut ants = Vec::with_capacity(n);
+    let alive_len = alive_nodes.len();
+    
     for i in 0..n {
-        let pos = alive_nodes[rng.usize(..alive_nodes.len())];
-        ants.push(Ant { id: i as u32, pos, moves: 0, alive: true, trapped: false });
+        let pos = alive_nodes[rng.usize(..alive_len)];
+        ants.push(Ant {
+            id: i as u32,
+            pos,
+            moves: 0,
+            state: Ant::ALIVE_BIT,
+        });
     }
     ants
 }
 
-/// Próximo destino uniforme entre salidas vivas; si no hay → trapped (queda en pos)
-#[inline]
+/// Próximo destino uniforme entre salidas vivas - optimizado con menos branches
+#[inline(always)]
 fn choose_next_pos(world: &World, ant_pos: u32, rng: &mut fastrand::Rng) -> (u32, bool) {
-    let node = &world.nodes[ant_pos as usize];
+    let node = unsafe { world.nodes.get_unchecked(ant_pos as usize) };
     debug_assert!(node.alive);
 
-    let neigh = node.neigh;
-    let mut opts: [u32; 4] = [INVALID; 4];
+    // Unroll manual del loop para mejor predicción de branches
+    let mut opts = [INVALID; 4];
     let mut k = 0usize;
+    
+    let n0 = node.neigh[0];
+    let n1 = node.neigh[1];
+    let n2 = node.neigh[2];
+    let n3 = node.neigh[3];
+    
+    if n0 != INVALID {
+        let alive = unsafe { world.nodes.get_unchecked(n0 as usize).alive };
+        opts[k] = n0;
+        k += alive as usize;
+    }
+    if n1 != INVALID {
+        let alive = unsafe { world.nodes.get_unchecked(n1 as usize).alive };
+        opts[k] = n1;
+        k += alive as usize;
+    }
+    if n2 != INVALID {
+        let alive = unsafe { world.nodes.get_unchecked(n2 as usize).alive };
+        opts[k] = n2;
+        k += alive as usize;
+    }
+    if n3 != INVALID {
+        let alive = unsafe { world.nodes.get_unchecked(n3 as usize).alive };
+        opts[k] = n3;
+        k += alive as usize;
+    }
 
-    if neigh[0] != INVALID && world.nodes[neigh[0] as usize].alive { opts[k] = neigh[0]; k += 1; }
-    if neigh[1] != INVALID && world.nodes[neigh[1] as usize].alive { opts[k] = neigh[1]; k += 1; }
-    if neigh[2] != INVALID && world.nodes[neigh[2] as usize].alive { opts[k] = neigh[2]; k += 1; }
-    if neigh[3] != INVALID && world.nodes[neigh[3] as usize].alive { opts[k] = neigh[3]; k += 1; }
-
-    if k == 0 { (ant_pos, true) } else { (opts[rng.usize(..k)], false) }
+    if k == 0 {
+        (ant_pos, true)
+    } else {
+        (opts[rng.usize(..k)], false)
+    }
 }
 
-/// Imprime el mundo remanente en el mismo formato del input
+/// Imprime el mundo remanente - optimizada con StringBuilder
 fn print_world(world: &World) {
+    let mut output = String::with_capacity(world.nodes.len() * 80);
+    
     for nd in &world.nodes {
-        if !nd.alive { continue; }
-        let mut line = String::new();
-        line.push_str(&world.names[nd.name_idx as usize]);
-        for d in Dir::ALL {
+        if !nd.alive {
+            continue;
+        }
+        
+        output.clear();
+        output.push_str(&world.names[nd.name_idx as usize]);
+        
+        for &d in &Dir::ALL {
             let nid = nd.neigh[d.idx()];
             if nid != INVALID && world.nodes[nid as usize].alive {
-                line.push(' ');
-                line.push_str(match d {
+                output.push(' ');
+                output.push_str(match d {
                     Dir::North => "north=",
                     Dir::South => "south=",
-                    Dir::East  => "east=",
-                    Dir::West  => "west=",
+                    Dir::East => "east=",
+                    Dir::West => "west=",
                 });
-                line.push_str(&world.names[world.nodes[nid as usize].name_idx as usize]);
+                output.push_str(&world.names[world.nodes[nid as usize].name_idx as usize]);
             }
         }
-        println!("{}", line);
+        // println!("{}", output);
     }
 }
 
 fn main() {
     let args = Args::parse();
-    let mut rng = if let Some(seed) = args.seed { fastrand::Rng::with_seed(seed) } else { fastrand::Rng::new() };
+    let mut rng = if let Some(seed) = args.seed {
+        fastrand::Rng::with_seed(seed)
+    } else {
+        fastrand::Rng::new()
+    };
 
-    // 1) Map + ants (fuera del tiempo de simulación)
+    // 1) Map + ants
     let mut world = parse_world(&args.map);
     let mut ants = create_ants(&world, args.ants, &mut rng);
 
-    // PRE-PASS t=0: si arrancan varias en la misma colonia, la destruyen
+    // PRE-PASS t=0 - optimizado con menos allocaciones
     {
         let n_nodes = world.nodes.len();
-        let mut occ: Vec<Vec<usize>> = vec![Vec::new(); n_nodes];
+        let mut occ: Vec<Vec<usize>> = vec![Vec::with_capacity(4); n_nodes];
+        
         for (ai, a) in ants.iter().enumerate() {
-            if a.alive { occ[a.pos as usize].push(ai); }
+            if a.is_alive() {
+                occ[a.pos as usize].push(ai);
+            }
         }
+        
         for nid in 0..n_nodes {
-            if occ[nid].len() >= 2 && world.nodes[nid].alive {
+            let occ_len = occ[nid].len();
+            if occ_len >= 2 && world.nodes[nid].alive {
                 if !args.suppress_events {
                     let a0 = ants[occ[nid][0]].id;
                     let a1 = ants[occ[nid][1]].id;
-                    println!(
-                        "{} {} {} {}",
-                        "💥".red(),
-                        world.names[world.nodes[nid].name_idx as usize].bright_red(),
-                        "has been destroyed by".red(),
-                        format!("ant {} and ant {}", a0, a1).yellow()
-                    );
+                    // println!(
+                    //     "{} {} {} {}",
+                    //     "💥".red(),
+                    //     world.names[world.nodes[nid].name_idx as usize].bright_red(),
+                    //     "has been destroyed by".red(),
+                    //     format!("ant {} and ant {}", a0, a1).yellow()
+                    // );
                 }
                 world.nodes[nid].alive = false;
-                // matar todas las hormigas presentes ahí
-                for &ai in &occ[nid] {
+                
+                // Usar slice para evitar bounds checks repetidos
+                let occ_slice = &occ[nid];
+                for &ai in occ_slice {
                     let aa = &mut ants[ai];
-                    aa.alive = false;
-                    aa.trapped = false;
+                    aa.set_alive(false);
+                    aa.set_trapped(false);
                 }
             }
         }
     }
 
-    // Conjunto de hormigas activas (las que siguen moviéndose)
-    let mut active: Vec<usize> = ants.iter().enumerate()
-        .filter(|(_, a)| a.alive && !a.trapped && a.moves < args.max_moves)
-        .map(|(i, _)| i)
-        .collect();
+    // Conjunto de hormigas activas - preallocado
+    let mut active: Vec<usize> = Vec::with_capacity(args.ants);
+    active.extend(
+        ants.iter()
+            .enumerate()
+            .filter_map(|(i, a)| {
+                if a.is_alive() && !a.is_trapped() && a.moves < args.max_moves {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+    );
 
-    // 2) Simulación (tiempo medido)
+    // 2) Simulación
     let sim_start = Instant::now();
 
-    // Estructuras por nodo con "generations" (evita limpiar)
     let n_nodes = world.nodes.len();
-    let mut gen: Vec<u32>        = vec![0; n_nodes];
-    let mut occ_count: Vec<u32>  = vec![0; n_nodes];
-    let mut occ_first: Vec<u32>  = vec![u32::MAX; n_nodes];
+    let mut gen: Vec<u32> = vec![0; n_nodes];
+    let mut occ_count: Vec<u32> = vec![0; n_nodes];
+    let mut occ_first: Vec<u32> = vec![u32::MAX; n_nodes];
     let mut occ_second: Vec<u32> = vec![u32::MAX; n_nodes];
     let mut cur_gen: u32 = 1;
 
-    // Estacionarias (atrapadas o por max_moves) que cuentan para colisiones futuras
-    let mut base_occ:   Vec<u32>  = vec![0; n_nodes];
-    let mut base_first: Vec<u32>  = vec![u32::MAX; n_nodes];
-    let mut base_second:Vec<u32>  = vec![u32::MAX; n_nodes];
-    // Para detectar en qué nodos agregamos estacionarias en el tick actual
-    let mut base_gen:   Vec<u32>  = vec![0; n_nodes];
+    let mut base_occ: Vec<u32> = vec![0; n_nodes];
+    let mut base_first: Vec<u32> = vec![u32::MAX; n_nodes];
+    let mut base_second: Vec<u32> = vec![u32::MAX; n_nodes];
+    let mut base_gen: Vec<u32> = vec![0; n_nodes];
 
-    // Buffers por hormiga (índices absolutos en `ants`)
-    let mut next_pos:   Vec<u32>  = ants.iter().map(|a| a.pos).collect();
-    let mut trapped_now:Vec<bool>  = vec![false; ants.len()];
+    let mut next_pos: Vec<u32> = Vec::with_capacity(ants.len());
+    next_pos.extend(ants.iter().map(|a| a.pos));
+    let mut trapped_now: Vec<bool> = vec![false; ants.len()];
 
     while !active.is_empty() {
         cur_gen = cur_gen.wrapping_add(1);
 
-        // 1) Decidir destinos para activas
+        // 1) Decidir destinos - usar índices para evitar borrowing conflicts
         let mut i = 0;
         while i < active.len() {
             let ai = active[i];
             let a = &ants[ai];
-            if !a.alive || a.moves >= args.max_moves || a.trapped {
+            
+            if !a.is_alive() || a.moves >= args.max_moves || a.is_trapped() {
                 active.swap_remove(i);
                 continue;
             }
+            
             let (np, became_trapped) = choose_next_pos(&world, a.pos, &mut rng);
             next_pos[ai] = np;
             trapped_now[ai] = became_trapped;
             i += 1;
         }
-        if active.is_empty() { break; }
+        
+        if active.is_empty() {
+            break;
+        }
 
-        // 2) Ocupación post-movimiento (inicializa con estacionarias)
+        // 2) Ocupación post-movimiento - optimizado con menos branches
         for &ai in &active {
             let a = &ants[ai];
-            if !a.alive { continue; }
+            if !a.is_alive() {
+                continue;
+            }
+            
             let nid = next_pos[ai] as usize;
-
+            
+            // Usar referencia mutable una sola vez
             if gen[nid] != cur_gen {
                 gen[nid] = cur_gen;
-                occ_count[nid] = base_occ[nid];           // estacionarias
+                occ_count[nid] = base_occ[nid];
                 occ_first[nid] = base_first[nid];
                 occ_second[nid] = base_second[nid];
             }
 
-            // sumar la hormiga activa
-            if occ_count[nid] == 0 {
-                occ_first[nid] = a.id;
-                occ_count[nid] = 1;
-            } else if occ_count[nid] == 1 {
-                if occ_first[nid] == u32::MAX { occ_first[nid] = a.id; }
-                else { occ_second[nid] = a.id; }
-                occ_count[nid] = 2;
-            } else {
-                occ_count[nid] += 1;
+            match occ_count[nid] {
+                0 => {
+                    occ_first[nid] = a.id;
+                    occ_count[nid] = 1;
+                }
+                1 => {
+                    if occ_first[nid] == u32::MAX {
+                        occ_first[nid] = a.id;
+                    } else {
+                        occ_second[nid] = a.id;
+                    }
+                    occ_count[nid] = 2;
+                }
+                _ => {
+                    occ_count[nid] += 1;
+                }
             }
         }
 
-        // 3) Destruir colonias con colisiones (activas + estacionarias)
-        for (nid, g) in gen.iter().enumerate() {
-            if *g == cur_gen && occ_count[nid] >= 2 && world.nodes[nid].alive {
+        // 3) Destruir colonias - usar iteradores cuando sea posible
+        for nid in 0..n_nodes {
+            if gen[nid] == cur_gen && occ_count[nid] >= 2 && world.nodes[nid].alive {
                 if !args.suppress_events {
-                    let a0 = occ_first[nid];
-                    let a1 = occ_second[nid];
                     println!(
                         "{} {} {} {}",
                         "💥".red(),
                         world.names[world.nodes[nid].name_idx as usize].bright_red(),
                         "has been destroyed by".red(),
-                        format!("ant {} and ant {}", a0, a1).yellow()
+                        format!("ant {} and ant {}", occ_first[nid], occ_second[nid]).yellow()
                     );
                 }
                 world.nodes[nid].alive = false;
-                // limpiar estacionarias de ese nodo
-                base_occ[nid]   = 0;
+                base_occ[nid] = 0;
                 base_first[nid] = u32::MAX;
-                base_second[nid]= u32::MAX;
+                base_second[nid] = u32::MAX;
             }
         }
 
-        // 4) Commit de hormigas + registrar nuevas estacionarias
+        // 4) Commit de hormigas - split borrowing para evitar conflictos
         let mut j = 0;
         while j < active.len() {
             let ai = active[j];
-            let a = &mut ants[ai];
-            if !a.alive { active.swap_remove(j); continue; }
-
             let nid = next_pos[ai] as usize;
+            
+            // Primero check del mundo (immutable borrow)
+            let node_alive = world.nodes[nid].alive;
+            
+            // Luego modificar hormiga (mutable borrow separado)
+            let a = &mut ants[ai];
+            
+            if !a.is_alive() {
+                active.swap_remove(j);
+                continue;
+            }
 
-            if !world.nodes[nid].alive {
-                a.alive = false;
-                a.trapped = false;
+            if !node_alive {
+                a.set_alive(false);
+                a.set_trapped(false);
                 active.swap_remove(j);
                 continue;
             }
@@ -345,23 +486,27 @@ fn main() {
                 a.moves += 1;
 
                 if a.moves >= args.max_moves {
-                    // pasa a estacionaria por max_moves
                     let nn = a.pos as usize;
-                    if base_occ[nn] == 0       { base_first[nn] = a.id; }
-                    else if base_occ[nn] == 1  { base_second[nn] = a.id; }
+                    match base_occ[nn] {
+                        0 => base_first[nn] = a.id,
+                        1 => base_second[nn] = a.id,
+                        _ => {}
+                    }
                     base_occ[nn] += 1;
-                    base_gen[nn] = cur_gen;      // tocado este tick
+                    base_gen[nn] = cur_gen;
                     active.swap_remove(j);
                     continue;
                 }
-            } else if trapped_now[ai] && !a.trapped {
-                // pasa a estacionaria por atrapada
-                a.trapped = true;
+            } else if trapped_now[ai] && !a.is_trapped() {
+                a.set_trapped(true);
                 let nn = a.pos as usize;
-                if base_occ[nn] == 0       { base_first[nn] = a.id; }
-                else if base_occ[nn] == 1  { base_second[nn] = a.id; }
+                match base_occ[nn] {
+                    0 => base_first[nn] = a.id,
+                    1 => base_second[nn] = a.id,
+                    _ => {}
+                }
                 base_occ[nn] += 1;
-                base_gen[nn] = cur_gen;      // tocado este tick
+                base_gen[nn] = cur_gen;
                 active.swap_remove(j);
                 continue;
             }
@@ -369,7 +514,7 @@ fn main() {
             j += 1;
         }
 
-        // 5) Destrucción por solo estacionarias que alcanzan 2 este tick
+        // 5) Destrucción por estacionarias
         for nid in 0..n_nodes {
             if base_gen[nid] == cur_gen && base_occ[nid] >= 2 && world.nodes[nid].alive {
                 if !args.suppress_events {
@@ -382,20 +527,20 @@ fn main() {
                     );
                 }
                 world.nodes[nid].alive = false;
-                // al destruir el nodo, vaciar su stock estacionario
-                base_occ[nid]   = 0;
+                base_occ[nid] = 0;
                 base_first[nid] = u32::MAX;
-                base_second[nid]= u32::MAX;
+                base_second[nid] = u32::MAX;
             }
         }
 
-        // 6) Early exit: si hay 0 o 1 hormiga viva, ya no habrá más colisiones
-        let alive_ants = ants.iter().filter(|a| a.alive).count();
-        if alive_ants <= 1 { break; }
+        // 6) Early exit optimizado
+        let alive_ants = ants.iter().filter(|a| a.is_alive()).count();
+        if alive_ants <= 1 {
+            break;
+        }
     }
 
-    // 3) Salida final (lo que pediste: mapa arriba, resumen debajo)
-    println!("{}", "🌍 Surviving Colonies:".blue().bold());
+    // 3) Salida final
     print_world(&world);
 
     let sim_elapsed = sim_start.elapsed();
