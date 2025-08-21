@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn test_count_survivors() {
-        let (names, mut nodes) = parse_world_from_str("A north=B\nB south=A\nC\n");
+        let (names, nodes) = parse_world_from_str("A north=B\nB south=A\nC\n");
         let world = World::new(names, nodes);
         
         assert_eq!(world.count_survivors(), 3);
