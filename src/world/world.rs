@@ -137,3 +137,109 @@ impl World {
         &self.names[self.nodes[node_id as usize].name_idx as usize]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::parser::parse_world_from_str;
+
+    /// Helper function to find a node id by name
+    fn id_of(world: &World, name: &str) -> u32 {
+        world
+            .names
+            .iter()
+            .position(|n| n == name)
+            .expect("name not found") as u32
+    }
+
+    #[test]
+    fn test_world_creation() {
+        let (names, nodes) = parse_world_from_str("A north=B\nB south=A\n");
+        let world = World::new(names, nodes);
+        
+        assert_eq!(world.names.len(), 2);
+        assert_eq!(world.nodes.len(), 2);
+    }
+
+    #[test]
+    fn test_choose_next_position_trapped() {
+        let (names, nodes) = parse_world_from_str("Isolated\n");
+        let world = World::new(names, nodes);
+        let isolated_id = id_of(&world, "Isolated");
+        
+        let mut rng = fastrand::Rng::with_seed(123);
+        let (next_pos, is_trapped) = world.choose_next_position(isolated_id, &mut rng);
+        
+        assert_eq!(next_pos, isolated_id);
+        assert!(is_trapped);
+    }
+
+    #[test]
+    fn test_choose_next_position_single_exit() {
+        let (names, nodes) = parse_world_from_str("A east=B\n");
+        let world = World::new(names, nodes);
+        let a_id = id_of(&world, "A");
+        let b_id = id_of(&world, "B");
+        
+        let mut rng = fastrand::Rng::with_seed(42);
+        let (next_pos, is_trapped) = world.choose_next_position(a_id, &mut rng);
+        
+        assert_eq!(next_pos, b_id);
+        assert!(!is_trapped);
+    }
+
+    #[test]
+    fn test_create_ants() {
+        let (names, nodes) = parse_world_from_str("A north=B\nB south=A\n");
+        let world = World::new(names, nodes);
+        
+        let mut rng = fastrand::Rng::with_seed(123);
+        let ants = world.create_ants(5, &mut rng);
+        
+        assert_eq!(ants.len(), 5);
+        for (i, ant) in ants.iter().enumerate() {
+            assert_eq!(ant.id, i as u32);
+            assert!(ant.is_alive());
+            assert!(!ant.is_trapped());
+            assert_eq!(ant.moves, 0);
+        }
+    }
+
+    #[test]
+    fn test_count_survivors() {
+        let (names, mut nodes) = parse_world_from_str("A north=B\nB south=A\nC\n");
+        let world = World::new(names, nodes);
+        
+        assert_eq!(world.count_survivors(), 3);
+        
+        // Destroy one colony
+        let mut world = world;
+        let c_id = id_of(&world, "C");
+        world.nodes[c_id as usize].destroy();
+        
+        assert_eq!(world.count_survivors(), 2);
+    }
+
+    #[test]
+    fn test_get_colony_name() {
+        let (names, nodes) = parse_world_from_str("Colony1 north=Colony2\n");
+        let world = World::new(names, nodes);
+        let colony1_id = id_of(&world, "Colony1");
+        
+        assert_eq!(world.get_colony_name(colony1_id), "Colony1");
+    }
+
+    #[test]
+    fn test_node_access() {
+        let (names, nodes) = parse_world_from_str("A\n");
+        let world = World::new(names, nodes);
+        let a_id = id_of(&world, "A");
+        
+        let node = world.node(a_id).unwrap();
+        assert!(node.is_alive());
+        
+        let mut world = world;
+        let node_mut = world.node_mut(a_id);
+        assert!(node_mut.is_some());
+    }
+}

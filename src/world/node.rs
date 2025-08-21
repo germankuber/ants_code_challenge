@@ -48,3 +48,46 @@ impl Node {
         self.alive
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_node_creation() {
+        let node = Node::new(42);
+        
+        assert_eq!(node.name_idx, 42);
+        assert!(node.is_alive());
+        assert_eq!(node.neighbors, [INVALID_NODE; 4]);
+    }
+
+    #[test]
+    fn test_node_neighbors() {
+        let mut node = Node::new(0);
+        
+        // Initially no neighbors
+        for i in 0..4 {
+            assert_eq!(node.get_neighbor(i), None);
+        }
+        
+        // Set some neighbors
+        node.set_neighbor(0, 10); // North
+        node.set_neighbor(2, 20); // East
+        
+        assert_eq!(node.get_neighbor(0), Some(10));
+        assert_eq!(node.get_neighbor(1), None); // South
+        assert_eq!(node.get_neighbor(2), Some(20));
+        assert_eq!(node.get_neighbor(3), None); // West
+    }
+
+    #[test]
+    fn test_node_destruction() {
+        let mut node = Node::new(0);
+        
+        assert!(node.is_alive());
+        
+        node.destroy();
+        assert!(!node.is_alive());
+    }
+}
