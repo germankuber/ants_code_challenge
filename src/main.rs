@@ -15,9 +15,9 @@ enum Dir {
     West = 3,
 }
 impl std::str::FromStr for Dir {
-    type Err = ();
+    type Err = ParseError;
 
-    #[inline(always)]
+    #[inline]
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // byte match is faster than string match
         match s.as_bytes() {
@@ -25,15 +25,15 @@ impl std::str::FromStr for Dir {
             b"south" => Ok(Dir::South),
             b"east" => Ok(Dir::East),
             b"west" => Ok(Dir::West),
-            _ => Err(()),
+            _ => Err(ParseError::InvalidDirection(s.to_string())),
         }
     }
 }
 
 impl Dir {
     pub const ALL: [Dir; 4] = [Dir::North, Dir::South, Dir::East, Dir::West];
-    
-    #[inline(always)]
+
+    #[inline]
     const fn idx(self) -> usize {
         self as usize
     }
@@ -44,7 +44,6 @@ const INVALID: u32 = u32::MAX;
 
 /// Graph node: compact and cache-friendly
 #[derive(Clone, Debug)]
-#[repr(C)]
 struct Node {
     name_idx: u32,   // index into `names`
     neigh: [u32; 4], // neighbors by direction; INVALID if none
@@ -70,7 +69,6 @@ struct World {
 
 /// Ant state packed into a byte (alive/trapped) + aligned fields
 #[derive(Clone, Debug)]
-#[repr(C)]
 struct Ant {
     pos: u32,
     id: u32,
@@ -81,15 +79,15 @@ impl Ant {
     const ALIVE: u8 = 0b01;
     const TRAPPED: u8 = 0b10;
 
-    #[inline(always)]
+    #[inline]
     fn is_alive(&self) -> bool {
         self.state & Self::ALIVE != 0
     }
-    #[inline(always)]
+    #[inline]
     fn is_trapped(&self) -> bool {
         self.state & Self::TRAPPED != 0
     }
-    #[inline(always)]
+    #[inline]
     fn set_alive(&mut self, v: bool) {
         if v {
             self.state |= Self::ALIVE
@@ -97,7 +95,7 @@ impl Ant {
             self.state &= !Self::ALIVE
         }
     }
-    #[inline(always)]
+    #[inline]
     fn set_trapped(&mut self, v: bool) {
         if v {
             self.state |= Self::TRAPPED
@@ -170,9 +168,9 @@ fn parse_world(path: &str) -> Result<World, ParseError> {
         }
 
         let mut parts = line.split_whitespace();
-        let colony = parts.next().ok_or_else(|| {
-            ParseError::InvalidLine("missing colony name".to_string())
-        })?;
+        let colony = parts
+            .next()
+            .ok_or_else(|| ParseError::InvalidLine("missing colony name".to_string()))?;
 
         let src_id = *name_to_id.entry(colony.to_string()).or_insert_with(|| {
             let id = names.len() as u32;
@@ -184,9 +182,7 @@ fn parse_world(path: &str) -> Result<World, ParseError> {
             if let Some(eq) = kv.find('=') {
                 let dir_s = &kv[..eq];
                 let dst_s = &kv[eq + 1..];
-                let dir = dir_s.parse().map_err(|_| {
-                    ParseError::InvalidDirection(dir_s.to_string())
-                })?;
+                let dir: Dir = dir_s.parse()?;
                 edges.push((src_id, dir, dst_s.to_string()));
             }
         }
@@ -234,11 +230,22 @@ fn create_ants(world: &World, n: usize, rng: &mut fastrand::Rng) -> Vec<Ant> {
         .collect()
 }
 
+/// SAFETY: all positions & neighbor ids come from `parse_world` and are never mutated out-of-bounds.
+/// Only called with valid node indices that exist in the world.
+#[inline(always)]
+fn node_unchecked(world: &World, idx: u32) -> &Node {
+    unsafe { world.nodes.get_unchecked(idx as usize) }
+}
+
 /// Next destination among alive exits; if none => trapped (stays in place)
+///
+/// # Safety invariants:
+/// - `ant_pos` is always a valid node index (< world.nodes.len())
+/// - `ant_pos` points to an alive colony (callers guarantee this)
+/// - All neighbor indices in nodes[ant_pos].neigh are either INVALID or valid node indices
 #[inline(always)]
 fn choose_next_pos(world: &World, ant_pos: u32, rng: &mut fastrand::Rng) -> (u32, bool) {
-    // Safety: ant_pos always within nodes len; callers guarantee ant is on an alive node
-    let node = unsafe { world.nodes.get_unchecked(ant_pos as usize) };
+    let node = node_unchecked(world, ant_pos);
     debug_assert!(node.alive);
 
     // Manual unroll; write candidate then increment `k` only if alive
@@ -251,22 +258,22 @@ fn choose_next_pos(world: &World, ant_pos: u32, rng: &mut fastrand::Rng) -> (u32
     let n3 = node.neigh[3];
 
     if n0 != INVALID {
-        let alive = unsafe { world.nodes.get_unchecked(n0 as usize).alive };
+        let alive = node_unchecked(world, n0).alive;
         opts[k] = n0;
         k += alive as usize;
     }
     if n1 != INVALID {
-        let alive = unsafe { world.nodes.get_unchecked(n1 as usize).alive };
+        let alive = node_unchecked(world, n1).alive;
         opts[k] = n1;
         k += alive as usize;
     }
     if n2 != INVALID {
-        let alive = unsafe { world.nodes.get_unchecked(n2 as usize).alive };
+        let alive = node_unchecked(world, n2).alive;
         opts[k] = n2;
         k += alive as usize;
     }
     if n3 != INVALID {
-        let alive = unsafe { world.nodes.get_unchecked(n3 as usize).alive };
+        let alive = node_unchecked(world, n3).alive;
         opts[k] = n3;
         k += alive as usize;
     }
@@ -276,6 +283,21 @@ fn choose_next_pos(world: &World, ant_pos: u32, rng: &mut fastrand::Rng) -> (u32
     } else {
         (opts[rng.usize(..k)], false)
     }
+}
+
+/// Log colony destruction event
+#[inline]
+fn log_destruction(args: &Args, world: &World, nid: usize, ant1: u32, ant2: u32) {
+    if args.suppress_events {
+        return;
+    }
+    println!(
+        "{} {} {} {}",
+        "💥".red(),
+        world.names[world.nodes[nid].name_idx as usize].bright_red(),
+        "has been destroyed by".red(),
+        format!("ant {} and ant {}", ant1, ant2).yellow()
+    );
 }
 
 /// Print the remaining world in the same input format
@@ -345,15 +367,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         for nid in 0..n {
             if occ_count[nid] >= 2 && world.nodes[nid].alive {
-                if !args.suppress_events {
-                    println!(
-                        "{} {} {} {}",
-                        "💥".red(),
-                        world.names[world.nodes[nid].name_idx as usize].bright_red(),
-                        "has been destroyed by".red(),
-                        format!("ant {} and ant {}", occ_first[nid], occ_second[nid]).yellow()
-                    );
-                }
+                log_destruction(&args, &world, nid, occ_first[nid], occ_second[nid]);
                 world.nodes[nid].alive = false;
                 destroyed[nid] = true;
             }
@@ -462,15 +476,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // (3) Destroy collided colonies (only touched)
         for &nid in &touched_nodes {
             if occ_count[nid] >= 2 && world.nodes[nid].alive {
-                if !args.suppress_events {
-                    println!(
-                        "{} {} {} {}",
-                        "💥".red(),
-                        world.names[world.nodes[nid].name_idx as usize].bright_red(),
-                        "has been destroyed by".red(),
-                        format!("ant {} and ant {}", occ_first[nid], occ_second[nid]).yellow()
-                    );
-                }
+                log_destruction(&args, &world, nid, occ_first[nid], occ_second[nid]);
                 world.nodes[nid].alive = false;
                 // If destroyed, their stationary stock is now irrelevant
                 base_occ[nid] = 0;
@@ -539,15 +545,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // (5) Pure-stationary destruction (only nodes touched by new stationaries)
         for &nid in &base_touched {
             if base_occ[nid] >= 2 && world.nodes[nid].alive {
-                if !args.suppress_events {
-                    println!(
-                        "{} {} {} {}",
-                        "💥".red(),
-                        world.names[world.nodes[nid].name_idx as usize].bright_red(),
-                        "has been destroyed by".red(),
-                        format!("ant {} and ant {}", base_first[nid], base_second[nid]).yellow()
-                    );
-                }
+                log_destruction(&args, &world, nid, base_first[nid], base_second[nid]);
                 world.nodes[nid].alive = false;
                 base_occ[nid] = 0;
                 base_first[nid] = u32::MAX;
@@ -578,10 +576,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("max_moves={}", args.max_moves).cyan(),
         format!("survivors={}", survivors).cyan(),
     );
-    
+
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -599,7 +596,9 @@ mod tests {
 
         for raw in src.lines() {
             let line = raw.trim();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             let mut parts = line.split_whitespace();
             let colony = parts.next().expect("missing colony name");
 
@@ -638,7 +637,11 @@ mod tests {
 
     /// Find a node id by name. Panics if not found (tests should define it).
     fn id_of(world: &World, name: &str) -> u32 {
-        world.names.iter().position(|n| n == name).expect("name not found") as u32
+        world
+            .names
+            .iter()
+            .position(|n| n == name)
+            .expect("name not found") as u32
     }
 
     /// Format remaining world to a single string (without printing).
@@ -646,7 +649,9 @@ mod tests {
         let mut out = String::new();
         let mut line = String::with_capacity(128);
         for nd in &world.nodes {
-            if !nd.alive { continue; }
+            if !nd.alive {
+                continue;
+            }
             line.clear();
             line.push_str(&world.names[nd.name_idx as usize]);
             for &d in &Dir::ALL {
@@ -656,8 +661,8 @@ mod tests {
                     line.push_str(match d {
                         Dir::North => "north=",
                         Dir::South => "south=",
-                        Dir::East  => "east=",
-                        Dir::West  => "west=",
+                        Dir::East => "east=",
+                        Dir::West => "west=",
                     });
                     line.push_str(&world.names[world.nodes[nid as usize].name_idx as usize]);
                 }
@@ -680,9 +685,9 @@ mod tests {
         let c = id_of(&w, "C") as usize;
 
         assert_eq!(w.nodes[a].neigh[Dir::North.idx()], b as u32);
-        assert_eq!(w.nodes[a].neigh[Dir::West.idx()],  c as u32);
+        assert_eq!(w.nodes[a].neigh[Dir::West.idx()], c as u32);
         assert_eq!(w.nodes[a].neigh[Dir::South.idx()], INVALID);
-        assert_eq!(w.nodes[a].neigh[Dir::East.idx()],  INVALID);
+        assert_eq!(w.nodes[a].neigh[Dir::East.idx()], INVALID);
 
         assert_eq!(w.nodes[b].neigh[Dir::South.idx()], a as u32);
         assert_eq!(w.nodes[b].neigh[Dir::North.idx()], INVALID);
@@ -697,14 +702,28 @@ mod tests {
         let x = id_of(&w, "X");
 
         let mut ants = vec![
-            Ant { id: 1, pos: x, moves: 0, state: Ant::ALIVE },
-            Ant { id: 2, pos: x, moves: 0, state: Ant::ALIVE },
+            Ant {
+                id: 1,
+                pos: x,
+                moves: 0,
+                state: Ant::ALIVE,
+            },
+            Ant {
+                id: 2,
+                pos: x,
+                moves: 0,
+                state: Ant::ALIVE,
+            },
         ];
 
         // Reproduce the t=0 pre-pass in a compact way
         let n = w.nodes.len();
         let mut occ_count = vec![0u32; n];
-        for a in &ants { if a.is_alive() { occ_count[a.pos as usize] += 1; } }
+        for a in &ants {
+            if a.is_alive() {
+                occ_count[a.pos as usize] += 1;
+            }
+        }
         for nid in 0..n {
             if occ_count[nid] >= 2 && w.nodes[nid].alive {
                 w.nodes[nid].alive = false;
@@ -717,8 +736,14 @@ mod tests {
             }
         }
 
-        assert!(!w.nodes[x as usize].alive, "colony X must be destroyed at t=0");
-        assert!(!ants[0].is_alive() && !ants[1].is_alive(), "both ants must die");
+        assert!(
+            !w.nodes[x as usize].alive,
+            "colony X must be destroyed at t=0"
+        );
+        assert!(
+            !ants[0].is_alive() && !ants[1].is_alive(),
+            "both ants must die"
+        );
     }
 
     #[test]
@@ -750,8 +775,8 @@ mod tests {
         let a = id_of(&w, "A") as usize;
 
         // Stationary stock like in runtime
-        let mut base_occ    = vec![0u32; w.nodes.len()];
-        let mut base_first  = vec![u32::MAX; w.nodes.len()];
+        let mut base_occ = vec![0u32; w.nodes.len()];
+        let mut base_first = vec![u32::MAX; w.nodes.len()];
         let base_second = vec![u32::MAX; w.nodes.len()];
 
         // One stationary already at A
@@ -759,9 +784,9 @@ mod tests {
         base_first[a] = 100;
 
         // Build occupancy for an arriving active ant with id=7
-        let mut gen        = vec![0u32; w.nodes.len()];
-        let mut occ_count  = vec![0u32; w.nodes.len()];
-        let mut occ_first  = vec![u32::MAX; w.nodes.len()];
+        let mut gen = vec![0u32; w.nodes.len()];
+        let mut occ_count = vec![0u32; w.nodes.len()];
+        let mut occ_first = vec![u32::MAX; w.nodes.len()];
         let mut occ_second = vec![u32::MAX; w.nodes.len()];
         let cur_gen = 999u32;
 
@@ -770,15 +795,18 @@ mod tests {
             gen[a] = cur_gen;
             occ_count[a] = base_occ[a];
             occ_first[a] = base_first[a];
-            occ_second[a]= base_second[a];
+            occ_second[a] = base_second[a];
         }
         // add active
         if occ_count[a] == 0 {
             occ_first[a] = 7;
             occ_count[a] = 1;
         } else if occ_count[a] == 1 {
-            if occ_first[a] == u32::MAX { occ_first[a] = 7; }
-            else { occ_second[a] = 7; }
+            if occ_first[a] == u32::MAX {
+                occ_first[a] = 7;
+            } else {
+                occ_second[a] = 7;
+            }
             occ_count[a] = 2;
         }
 
@@ -787,7 +815,10 @@ mod tests {
             w.nodes[a].alive = false;
         }
 
-        assert!(!w.nodes[a].alive, "A must be destroyed by stationary + active");
+        assert!(
+            !w.nodes[a].alive,
+            "A must be destroyed by stationary + active"
+        );
         assert_eq!(occ_first[a], 100);
         assert_eq!(occ_second[a], 7);
     }
