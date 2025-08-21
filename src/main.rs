@@ -1,5 +1,5 @@
 use clap::Parser;
-use colored::*;
+use colored::Colorize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -14,21 +14,27 @@ enum Dir {
     East = 2,
     West = 3,
 }
-impl Dir {
+impl std::str::FromStr for Dir {
+    type Err = ();
+
     #[inline(always)]
-    fn from_str(s: &str) -> Option<Dir> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         // byte match is faster than string match
         match s.as_bytes() {
-            b"north" => Some(Dir::North),
-            b"south" => Some(Dir::South),
-            b"east" => Some(Dir::East),
-            b"west" => Some(Dir::West),
-            _ => None,
+            b"north" => Ok(Dir::North),
+            b"south" => Ok(Dir::South),
+            b"east" => Ok(Dir::East),
+            b"west" => Ok(Dir::West),
+            _ => Err(()),
         }
     }
+}
+
+impl Dir {
     pub const ALL: [Dir; 4] = [Dir::North, Dir::South, Dir::East, Dir::West];
+    
     #[inline(always)]
-    fn idx(self) -> usize {
+    const fn idx(self) -> usize {
         self as usize
     }
 }
@@ -122,9 +128,34 @@ struct Args {
     suppress_events: bool,
 }
 
+#[derive(Debug)]
+enum ParseError {
+    IoError(std::io::Error),
+    InvalidLine(String),
+    InvalidDirection(String),
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::IoError(err) => write!(f, "IO error: {}", err),
+            ParseError::InvalidLine(msg) => write!(f, "Invalid line: {}", msg),
+            ParseError::InvalidDirection(dir) => write!(f, "Invalid direction: {}", dir),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+impl From<std::io::Error> for ParseError {
+    fn from(err: std::io::Error) -> Self {
+        ParseError::IoError(err)
+    }
+}
+
 /// Fast parser with preallocation; the hashmap exists only here
-fn parse_world(path: &str) -> World {
-    let file = File::open(path).expect("cannot open map file");
+fn parse_world(path: &str) -> Result<World, ParseError> {
+    let file = File::open(path)?;
     let reader = BufReader::with_capacity(64 * 1024, file);
 
     let mut names: Vec<String> = Vec::with_capacity(1024);
@@ -132,14 +163,16 @@ fn parse_world(path: &str) -> World {
     let mut edges: Vec<(u32, Dir, String)> = Vec::with_capacity(4096);
 
     for line in reader.lines() {
-        let line = line.expect("failed to read line");
+        let line = line?;
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
 
         let mut parts = line.split_whitespace();
-        let colony = parts.next().expect("invalid line: missing colony name");
+        let colony = parts.next().ok_or_else(|| {
+            ParseError::InvalidLine("missing colony name".to_string())
+        })?;
 
         let src_id = *name_to_id.entry(colony.to_string()).or_insert_with(|| {
             let id = names.len() as u32;
@@ -151,9 +184,10 @@ fn parse_world(path: &str) -> World {
             if let Some(eq) = kv.find('=') {
                 let dir_s = &kv[..eq];
                 let dst_s = &kv[eq + 1..];
-                if let Some(dir) = Dir::from_str(dir_s) {
-                    edges.push((src_id, dir, dst_s.to_string()));
-                }
+                let dir = dir_s.parse().map_err(|_| {
+                    ParseError::InvalidDirection(dir_s.to_string())
+                })?;
+                edges.push((src_id, dir, dst_s.to_string()));
             }
         }
     }
@@ -175,7 +209,7 @@ fn parse_world(path: &str) -> World {
         }
     }
 
-    World { names, nodes }
+    Ok(World { names, nodes })
 }
 
 /// Place ants uniformly at alive nodes
@@ -184,21 +218,20 @@ fn create_ants(world: &World, n: usize, rng: &mut fastrand::Rng) -> Vec<Ant> {
         .nodes
         .iter()
         .enumerate()
-        .filter_map(|(i, nd)| if nd.alive { Some(i as u32) } else { None })
+        .filter_map(|(i, nd)| nd.alive.then_some(i as u32))
         .collect();
 
-    let mut ants = Vec::with_capacity(n);
-    let alive_len = alive_nodes.len();
-    for i in 0..n {
-        let pos = alive_nodes[rng.usize(..alive_len)];
-        ants.push(Ant {
-            id: i as u32,
-            pos,
-            moves: 0,
-            state: Ant::ALIVE,
-        });
-    }
-    ants
+    (0..n)
+        .map(|i| {
+            let pos = alive_nodes[rng.usize(..alive_nodes.len())];
+            Ant {
+                id: i as u32,
+                pos,
+                moves: 0,
+                state: Ant::ALIVE,
+            }
+        })
+        .collect()
 }
 
 /// Next destination among alive exits; if none => trapped (stays in place)
@@ -272,7 +305,7 @@ fn print_world(world: &World) {
     }
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let mut rng = if let Some(seed) = args.seed {
         fastrand::Rng::with_seed(seed)
@@ -281,7 +314,7 @@ fn main() {
     };
 
     // 1) Parse + ants (excluded from latency)
-    let mut world = parse_world(&args.map);
+    let mut world = parse_world(&args.map)?;
     let mut ants = create_ants(&world, args.ants, &mut rng);
 
     // --- t=0 pre-pass collisions (O(ants) + O(destroyed_nodes)) without Vec<Vec<_>> ---
@@ -545,6 +578,8 @@ fn main() {
         format!("max_moves={}", args.max_moves).cyan(),
         format!("survivors={}", survivors).cyan(),
     );
+    
+    Ok(())
 }
 
 
@@ -578,7 +613,7 @@ mod tests {
                 if let Some(eq) = kv.find('=') {
                     let dir_s = &kv[..eq];
                     let dst_s = &kv[eq + 1..];
-                    let dir = Dir::from_str(dir_s).expect("invalid direction");
+                    let dir = dir_s.parse().expect("invalid direction");
                     edges.push((src_id, dir, dst_s.to_string()));
                 }
             }
@@ -717,7 +752,7 @@ mod tests {
         // Stationary stock like in runtime
         let mut base_occ    = vec![0u32; w.nodes.len()];
         let mut base_first  = vec![u32::MAX; w.nodes.len()];
-        let mut base_second = vec![u32::MAX; w.nodes.len()];
+        let base_second = vec![u32::MAX; w.nodes.len()];
 
         // One stationary already at A
         base_occ[a] = 1;
@@ -760,7 +795,7 @@ mod tests {
     #[test]
     fn world_print_formatting_like_input() {
         // A east=B; C isolated
-        let mut w = parse_world_from_str("A east=B\nC\n");
+        let w = parse_world_from_str("A east=B\nC\n");
         let out = format_world(&w);
         assert!(out.contains("A east=B"));
         assert!(out.contains("C\n") || out.ends_with("C"));
