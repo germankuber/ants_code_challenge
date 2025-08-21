@@ -392,15 +392,6 @@ done
 
 ---
 
-## 🔮 Future work (ideas)
-
-- Optional per-ant RNG for strict determinism across refactors.
-- Bitset for node alive status to shrink Node further.
-- Parallelism by sharding ants + two-phase reduce (careful with collisions).
-- `tracing` + `env_filter` for structured logging without cost when disabled.
-
----
-
 ## 📚 Example map (tiny)
 
 ```
